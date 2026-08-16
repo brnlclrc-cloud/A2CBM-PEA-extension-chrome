@@ -1,4 +1,4 @@
-// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.0 ---
+// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.2 ---
 
 const URL_PROD = "https://a2cbm-pea-backend-prod.onrender.com/api";
 const URL_TEST = "https://a2cbm-pea-backend-qs4v.onrender.com/api";
@@ -33,8 +33,8 @@ async function autoDetectToken() {
   return null;
 }
 
-// Fonction d'extraction propre du DOM BNP (ignore script/style/svg/etc.)
-function runCleanBnpExtraction() {
+// Fonction d'extraction universelle multi-contrats (v1.1.2)
+function runMultiContractBnpExtraction() {
   const cleanNumber = (str) => {
     if (!str) return 0;
     const cleaned = String(str).replace(/[\s\u00a0\u202f€%]/g, '').replace(',', '.');
@@ -42,7 +42,7 @@ function runCleanBnpExtraction() {
     return isNaN(val) ? 0 : val;
   };
 
-  // 1. Extraction récursive en sautant STRICTEMENT les balises script/style/svg/noscript
+  // 1. Extraction récursive du texte visible en sautant scripts et styles
   function getVisibleText(node) {
     if (!node) return '';
     const tag = (node.tagName || '').toUpperCase();
@@ -77,16 +77,37 @@ function runCleanBnpExtraction() {
   const visibleText = getVisibleText(document.body);
   const lines = visibleText.split('\n').map(l => l.trim()).filter(l => l.length > 0 && !l.includes('tailwindcss') && !l.includes('/*') && !l.includes('*/'));
 
-  // 2. Nom du Contrat
-  const contractNameMatch = visibleText.match(/BNP\s*PARIBAS\s*MULTIPLACEMENTS\s*[0-9]*/i);
-  const contractName = contractNameMatch ? contractNameMatch[0] : 'BNP Paribas Multiplacements 2';
+  // 2. Détection du Titulaire et du Contrat
+  const holderMatch = visibleText.match(/N°\s*[0-9]+\s*\|\s*([A-Z\s-]{4,30})/i);
+  const holderName = holderMatch ? holderMatch[1].trim() : '';
 
-  // 3. Valorisation Totale (ex: 14 387,39 €)
+  const contractNameMatch = visibleText.match(/BNP\s*PARIBAS\s*MULTIPLACEMENTS\s*[0-9]*/i);
+  let contractName = contractNameMatch ? contractNameMatch[0] : 'BNP Paribas Multiplacements 2';
+  if (holderName) {
+    contractName += ` (${holderName})`;
+  }
+
+  // 3. Détection de la Valorisation Totale ciblée (ancrée sur "Valorisation épargne")
   let totalVal = 0;
-  const allAmounts = Array.from(visibleText.matchAll(/(?:(?:\d{1,3}[\s\u00a0\u202f]?\d{3})|\d+)[.,]\d{2}/g)).map(m => cleanNumber(m[0]));
-  const valCandidates = allAmounts.filter(a => a >= 10000 && a !== 10600);
-  if (valCandidates.length > 0) {
-    totalVal = valCandidates[0]; // 14387.39
+
+  // Regex ancrée sur "Valorisation épargne" (immédiatement avant ou après)
+  const valBeforeMatch = visibleText.match(/((?:\d{1,3}[\s\u00a0\u202f]?\d{3})|\d+)[.,]\d{2}\s*€[\s\S]{0,100}?Valorisation\s*épargne/i);
+  const valAfterMatch = visibleText.match(/Valorisation\s*épargne[\s\S]{0,100}?((?:\d{1,3}[\s\u00a0\u202f]?\d{3})|\d+)[.,]\d{2}\s*€/i);
+
+  if (valBeforeMatch) {
+    totalVal = cleanNumber(valBeforeMatch[1]);
+  } else if (valAfterMatch) {
+    totalVal = cleanNumber(valAfterMatch[1]);
+  }
+
+  // Fallback : recherche du montant en haut de page dans le bandeau vert
+  if (!totalVal || totalVal === 0) {
+    const repIdx = visibleText.indexOf('RÉPARTITION');
+    const headerSnippet = repIdx !== -1 ? visibleText.substring(0, repIdx) : visibleText.substring(0, 1000);
+    const headerAmounts = Array.from(headerSnippet.matchAll(/(?:(?:\d{1,3}[\s\u00a0\u202f]?\d{3})|\d+)[.,]\d{2}/g)).map(m => cleanNumber(m[0]));
+    if (headerAmounts.length > 0) {
+      totalVal = headerAmounts[0];
+    }
   }
 
   // 4. Fonds en Euros
@@ -96,9 +117,11 @@ function runCleanBnpExtraction() {
     const feSnippet = visibleText.substring(fePos, fePos + 250);
     const feEuros = Array.from(feSnippet.matchAll(/((?:\d{1,3}(?:[\s\u00a0\u202f]\d{3})*|\d+)[.,]\d{2})\s*€/g)).map(m => cleanNumber(m[1]));
     if (feEuros.length > 0) {
-      fondEuros = feEuros.find(a => a > 100 && a !== 30.56) || feEuros[0];
+      fondEuros = feEuros.find(a => a > 50 && a !== 30.56 && a !== 46.61) || feEuros[0];
     }
   }
+
+  // Calcul par pourcentage (ex: 46,61 % ou 30,56 %) si non trouvé dans le tableau
   if ((!fondEuros || fondEuros === 0) && totalVal > 0) {
     const pctMatch = visibleText.match(/Fonds\s*en\s*Euros\s*:\s*([0-9]+[.,][0-9]+)\s*%/i);
     if (pctMatch) {
@@ -107,12 +130,12 @@ function runCleanBnpExtraction() {
     }
   }
 
-  // 5. Unités de Compte réelles
+  // 5. Extraction des Unités de Compte
   const isinRegex = /[A-Z]{2}[A-Z0-9]{9}[0-9]/g;
   const isins = Array.from(new Set((visibleText.match(isinRegex) || []).map(i => i.toUpperCase())));
   const details = [];
 
-  // A. Fonds en Euros dans les détails
+  // A. Fonds en Euros
   if (fondEuros > 0) {
     details.push({
       support: 'Fonds en Euros',
@@ -126,12 +149,11 @@ function runCleanBnpExtraction() {
     });
   }
 
-  // B. Scan de chaque ISIN dans les lignes visibles
+  // B. Unités de Compte individuelles
   isins.forEach(isin => {
     const isinLineIdx = lines.findIndex(l => l.toUpperCase().includes(isin));
     if (isinLineIdx === -1) return;
 
-    // Trouver le nom du support : chercher dans les 5 lignes au-dessus
     let name = 'Support UC';
     for (let j = isinLineIdx - 1; j >= Math.max(0, isinLineIdx - 5); j--) {
       const candidate = lines[j].replace(/PDF/gi, '').trim();
@@ -171,7 +193,7 @@ function runCleanBnpExtraction() {
 
     qty = numMatches.find(n => n !== totalAmount && n !== unitPrice && n > 0) || 0;
 
-    if (totalAmount > 0 && totalAmount < totalVal && !details.some(d => d.isin === isin)) {
+    if (totalAmount > 0 && totalAmount < (totalVal || 1000000) && !details.some(d => d.isin === isin)) {
       details.push({
         support: name,
         name: name,
@@ -188,6 +210,11 @@ function runCleanBnpExtraction() {
   // Calcul du total UC
   const ucOnlyTotal = details.filter(d => d.isin !== 'FONDS-EUROS').reduce((sum, d) => sum + d.montant, 0);
   let ucTotal = ucOnlyTotal > 0 ? Math.round(ucOnlyTotal * 100) / 100 : Math.round((totalVal - fondEuros) * 100) / 100;
+
+  // Si totalVal n'était pas précis, somme infaillible
+  if (!totalVal || totalVal === 0) {
+    totalVal = Math.round((fondEuros + ucTotal) * 100) / 100;
+  }
 
   const now = new Date();
   const monthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
@@ -278,13 +305,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   };
 
-  // 3. Analyse propre du DOM
+  // 3. Analyse approfondie et ciblée
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.id) {
       const results = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: runCleanBnpExtraction
+        func: runMultiContractBnpExtraction
       }).catch(err => {
         console.error("Injection error:", err);
       });
