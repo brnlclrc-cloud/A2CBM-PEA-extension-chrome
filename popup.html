@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>PEA Pro - Sync BNP</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { width: 360px; background: #0B1120; color: #E2E8F0; padding: 16px; font-size: 13px; }
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 10px; }
+    .title { font-size: 15px; font-weight: 800; color: #60A5FA; display: flex; align-items: center; gap: 6px; }
+    .version { font-size: 10px; background: rgba(59, 130, 246, 0.15); color: #93C5FD; padding: 2px 6px; border-radius: 99px; border: 1px solid rgba(59, 130, 246, 0.3); }
+    
+    .card { background: #151C2C; border: 1px solid rgba(255,255,255,0.1); border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+    .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .row:last-child { margin-bottom: 0; }
+    .label { color: #94A3B8; font-size: 11px; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
+    .value { font-weight: 700; font-size: 13px; color: #FFFFFF; font-family: ui-monospace, monospace; }
+    .value-total { color: #34D399; font-size: 16px; font-weight: 800; }
+
+    .env-toggle { display: flex; gap: 6px; background: #0F172A; padding: 3px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.06); margin-bottom: 12px; }
+    .env-btn { flex: 1; padding: 6px; border-radius: 7px; border: none; font-size: 11px; font-weight: 700; cursor: pointer; background: transparent; color: #94A3B8; transition: all 0.2s; }
+    .env-btn.active { background: #2563EB; color: #FFFFFF; box-shadow: 0 2px 8px rgba(37,99,235,0.4); }
+    .env-btn.active.test { background: #D97706; box-shadow: 0 2px 8px rgba(217,119,6,0.4); }
+
+    .sync-btn { width: 100%; padding: 12px; background: linear-gradient(135deg, #2563EB, #1D4ED8); border: none; border-radius: 12px; color: #FFFFFF; font-weight: 800; font-size: 13px; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 4px 14px rgba(37,99,235,0.3); }
+    .sync-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(37,99,235,0.4); }
+    .sync-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    .alert { padding: 10px; border-radius: 10px; font-size: 11px; text-align: center; margin-top: 10px; display: none; }
+    .alert.success { background: rgba(16,185,129,0.15); border: 1px solid #10B981; color: #34D399; }
+    .alert.error { background: rgba(239,68,68,0.15); border: 1px solid #EF4444; color: #F87171; }
+    
+    .settings-link { font-size: 11px; color: #64748B; text-align: center; margin-top: 10px; cursor: pointer; text-decoration: underline; }
+    .token-input { width: 100%; padding: 8px; background: #0F172A; border: 1px solid #334155; border-radius: 8px; color: #FFF; font-size: 11px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="title">
+      <span>📈</span> PEA Pro
+    </div>
+    <div class="version">BNP Sync v1.1.0</div>
+  </div>
+
+  <div class="env-toggle">
+    <button id="btnProd" class="env-btn active">🚀 Production</button>
+    <button id="btnTest" class="env-btn">🧪 Test (Dev)</button>
+  </div>
+
+  <div id="dataCard" class="card">
+    <div class="row">
+      <span class="label">Contrat</span>
+      <span id="contractName" class="value" style="font-size:11px;">Recherche...</span>
+    </div>
+    <div class="row">
+      <span class="label">Mois</span>
+      <input type="month" id="monthInput" style="background:#0F172A;border:1px solid #334155;color:#FFF;border-radius:6px;padding:2px 6px;font-size:11px;font-weight:bold;outline:none;">
+    </div>
+    <div class="row" style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.06);">
+      <span class="label">Valorisation</span>
+      <span id="totalValue" class="value value-total">0,00 €</span>
+    </div>
+    <div class="row">
+      <span class="label">Fonds Euros</span>
+      <span id="fondEuros" class="value">0,00 €</span>
+    </div>
+    <div class="row">
+      <span class="label">Unités de Compte</span>
+      <span id="ucTotal" class="value">0 ligne (0 €)</span>
+    </div>
+  </div>
+
+  <button id="syncBtn" class="sync-btn" disabled>
+    <span>🚀</span> Synchroniser avec PEA Pro
+  </button>
+
+  <div id="statusAlert" class="alert"></div>
+
+  <div id="tokenSection" style="display:none;margin-top:12px;padding:10px;background:#0F172A;border-radius:10px;border:1px solid #334155;">
+    <span class="label">Jeton Google / Session PEA Pro</span>
+    <input type="text" id="tokenField" placeholder="Collez votre token ici si besoin..." class="token-input">
+    <button id="saveTokenBtn" style="margin-top:6px;width:100%;padding:6px;background:#334155;color:#FFF;border:none;border-radius:6px;font-size:11px;font-weight:bold;cursor:pointer;">Enregistrer le Jeton</button>
+  </div>
+
+  <div id="toggleSettings" class="settings-link">⚙️ Configurer le Jeton de session</div>
+  <div id="toggleDebug" class="settings-link" style="color:#38bdf8;margin-top:6px;">🔍 Voir le texte détecté par l'extension</div>
+  <textarea id="debugBox" readonly style="display:none;width:100%;height:100px;background:#0f172a;color:#94a3b8;font-size:10px;border:1px solid #334155;border-radius:6px;margin-top:6px;padding:6px;font-family:monospace;resize:none;"></textarea>
+
+  <script src="popup.js"></script>
+</body>
+</html>
