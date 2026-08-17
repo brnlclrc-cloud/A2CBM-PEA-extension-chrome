@@ -1,4 +1,4 @@
-// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.2 ---
+// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.4 ---
 
 const URL_PROD = "https://a2cbm-pea-backend-prod.onrender.com/api";
 const URL_TEST = "https://a2cbm-pea-backend-qs4v.onrender.com/api";
@@ -33,7 +33,7 @@ async function autoDetectToken() {
   return null;
 }
 
-// Fonction d'extraction universelle multi-contrats (v1.1.2)
+// Fonction d'extraction universelle multi-contrats (v1.1.4)
 function runMultiContractBnpExtraction() {
   const cleanNumber = (str) => {
     if (!str) return 0;
@@ -89,8 +89,6 @@ function runMultiContractBnpExtraction() {
 
   // 3. Détection de la Valorisation Totale ciblée (ancrée sur "Valorisation épargne")
   let totalVal = 0;
-
-  // Regex ancrée sur "Valorisation épargne" (immédiatement avant ou après)
   const valBeforeMatch = visibleText.match(/((?:\d{1,3}[\s\u00a0\u202f]?\d{3})|\d+)[.,]\d{2}\s*€[\s\S]{0,100}?Valorisation\s*épargne/i);
   const valAfterMatch = visibleText.match(/Valorisation\s*épargne[\s\S]{0,100}?((?:\d{1,3}[\s\u00a0\u202f]?\d{3})|\d+)[.,]\d{2}\s*€/i);
 
@@ -100,7 +98,6 @@ function runMultiContractBnpExtraction() {
     totalVal = cleanNumber(valAfterMatch[1]);
   }
 
-  // Fallback : recherche du montant en haut de page dans le bandeau vert
   if (!totalVal || totalVal === 0) {
     const repIdx = visibleText.indexOf('RÉPARTITION');
     const headerSnippet = repIdx !== -1 ? visibleText.substring(0, repIdx) : visibleText.substring(0, 1000);
@@ -121,7 +118,6 @@ function runMultiContractBnpExtraction() {
     }
   }
 
-  // Calcul par pourcentage (ex: 46,61 % ou 30,56 %) si non trouvé dans le tableau
   if ((!fondEuros || fondEuros === 0) && totalVal > 0) {
     const pctMatch = visibleText.match(/Fonds\s*en\s*Euros\s*:\s*([0-9]+[.,][0-9]+)\s*%/i);
     if (pctMatch) {
@@ -207,10 +203,9 @@ function runMultiContractBnpExtraction() {
     }
   });
 
-  // Calcul du total UC : par définition exactement Total - Fonds Euros
+  // Calcul du total UC : par définition exactement Total - Fonds Euros (100% de cohérence)
   let ucTotal = Math.max(0, Math.round((totalVal - fondEuros) * 100) / 100);
 
-  // Si totalVal n'était pas précis, somme infaillible
   if (!totalVal || totalVal === 0) {
     totalVal = Math.round((fondEuros + ucTotal) * 100) / 100;
   }
@@ -251,16 +246,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
   monthInput.value = currentMonth;
 
-  // 2. Récupération des réglages & token automatique
-  chrome.storage.local.get(['savedToken', 'isTestEnv'], async (res) => {
-    let token = res.savedToken;
-    if (!token) {
-      token = await autoDetectToken();
-    }
-    if (token) {
-      tokenField.value = token;
-    }
+  // 2. Toujours chercher en direct un token frais dans les onglets PEA Pro
+  let liveToken = await autoDetectToken();
+  if (liveToken) {
+    tokenField.value = liveToken;
+  } else {
+    chrome.storage.local.get(['savedToken'], (res) => {
+      if (res.savedToken) tokenField.value = res.savedToken;
+    });
+  }
 
+  chrome.storage.local.get(['isTestEnv'], (res) => {
     if (res.isTestEnv !== undefined) {
       isTestEnv = res.isTestEnv;
       updateEnvButtons();
@@ -304,7 +300,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   };
 
-  // 3. Analyse approfondie et ciblée
+  // 3. Analyse propre du DOM
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab && tab.id) {
@@ -354,58 +350,63 @@ document.addEventListener('DOMContentLoaded', async () => {
     syncBtn.innerHTML = `<span>⏳</span> Synchronisation...`;
     statusAlert.style.display = 'none';
 
-    chrome.storage.local.get(['savedToken'], async (storageRes) => {
-      let token = storageRes.savedToken;
+    // Récupération en direct du jeton le plus récent
+    let token = await autoDetectToken();
+    if (!token) {
+      const storageRes = await chrome.storage.local.get(['savedToken']);
+      token = storageRes.savedToken;
+    }
 
-      if (!token) {
-        token = await autoDetectToken();
-      }
+    if (!token) {
+      showAlert("❌ Jeton manquant : ouvrez PEA Pro dans un onglet ou collez votre jeton dans ⚙️.", "error");
+      syncBtn.disabled = false;
+      syncBtn.innerHTML = `<span>🚀</span> Réessayer la synchronisation`;
+      tokenSection.style.display = 'block';
+      return;
+    }
 
-      if (!token) {
-        showAlert("❌ Jeton manquant : ouvrez PEA Pro dans un onglet ou collez votre jeton dans ⚙️.", "error");
-        syncBtn.disabled = false;
-        syncBtn.innerHTML = `<span>🚀</span> Réessayer la synchronisation`;
-        tokenSection.style.display = 'block';
-        return;
-      }
+    const apiUrl = isTestEnv ? URL_TEST : URL_PROD;
+    const targetMonth = monthInput.value || currentMonth;
 
-      const apiUrl = isTestEnv ? URL_TEST : URL_PROD;
-      const targetMonth = monthInput.value || currentMonth;
+    try {
+      const payload = {
+        action: 'addAVSnapshot',
+        month: targetMonth,
+        total_value: extractedData.totalVal,
+        fond_euros: extractedData.fondEuros,
+        unites_compte: extractedData.ucTotal,
+        details: extractedData.details,
+        monthly_transfer: 0,
+        token: token
+      };
 
-      try {
-        const payload = {
-          action: 'addAVSnapshot',
-          month: targetMonth,
-          total_value: extractedData.totalVal,
-          fond_euros: extractedData.fondEuros,
-          unites_compte: extractedData.ucTotal,
-          details: extractedData.details,
-          monthly_transfer: 0,
-          token: token
-        };
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
 
-        const res = await fetch(apiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        });
+      const data = await res.json();
 
-        const data = await res.json();
-
-        if (data.success) {
-          showAlert(`✅ Relevé de ${targetMonth} (${fmt(extractedData.totalVal)}) synchronisé avec succès !`, "success");
-          syncBtn.innerHTML = `<span>✅</span> Synchronisé !`;
+      if (data.success) {
+        showAlert(`✅ Relevé de ${targetMonth} (${fmt(extractedData.totalVal)}) synchronisé avec succès !`, "success");
+        syncBtn.innerHTML = `<span>✅</span> Synchronisé !`;
+      } else {
+        // En cas de jeton expiré, on vide le cache et on guide l'utilisateur
+        if (data.error && (data.error.includes('Jeton') || data.error.includes('expiré') || data.error.includes('invalide'))) {
+          chrome.storage.local.remove(['savedToken']);
+          showAlert(`❌ Session expirée : faites F5 dans votre onglet PEA Pro, puis recliquez ici.`, "error");
         } else {
           showAlert(`❌ Erreur API : ${data.error || 'Vérifiez votre session.'}`, "error");
-          syncBtn.disabled = false;
-          syncBtn.innerHTML = `<span>🚀</span> Réessayer la synchronisation`;
         }
-      } catch (e) {
-        showAlert(`❌ Échec réseau : ${e.message}`, "error");
         syncBtn.disabled = false;
         syncBtn.innerHTML = `<span>🚀</span> Réessayer la synchronisation`;
       }
-    });
+    } catch (e) {
+      showAlert(`❌ Échec réseau : ${e.message}`, "error");
+      syncBtn.disabled = false;
+      syncBtn.innerHTML = `<span>🚀</span> Réessayer la synchronisation`;
+    }
   };
 
   function showAlert(msg, type) {
