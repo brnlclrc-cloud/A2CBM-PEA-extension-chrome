@@ -207,9 +207,8 @@ function runMultiContractBnpExtraction() {
     }
   });
 
-  // Calcul du total UC
-  const ucOnlyTotal = details.filter(d => d.isin !== 'FONDS-EUROS').reduce((sum, d) => sum + d.montant, 0);
-  let ucTotal = ucOnlyTotal > 0 ? Math.round(ucOnlyTotal * 100) / 100 : Math.round((totalVal - fondEuros) * 100) / 100;
+  // Calcul du total UC : par définition exactement Total - Fonds Euros
+  let ucTotal = Math.max(0, Math.round((totalVal - fondEuros) * 100) / 100);
 
   // Si totalVal n'était pas précis, somme infaillible
   if (!totalVal || totalVal === 0) {
