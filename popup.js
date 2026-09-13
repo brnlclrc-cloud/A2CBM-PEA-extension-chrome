@@ -1,19 +1,54 @@
-// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.4 ---
+// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.5 ---
 
-const URL_PROD = "https://a2cbm-pea-backend-prod.onrender.com/api";
-const URL_TEST = "https://a2cbm-pea-backend-qs4v.onrender.com/api";
+// URLs avec Cloud Run en primaire et Render en secours
+const URLS_PROD = [
+  "https://a2cbm-pea-backend-prod-217698785901.europe-west9.run.app/api",
+  "https://a2cbm-pea-backend-prod.onrender.com/api",
+  "https://backup-prod-a2cbm-pea-backend.onrender.com/api"
+];
+
+const URLS_TEST = [
+  "https://a2cbm-pea-backend-test-217698785901.europe-west9.run.app/api",
+  "https://a2cbm-pea-backend-qs4v.onrender.com/api",
+  "https://backuo-a2cbm-pea-backend.onrender.com/api"
+];
 
 let isTestEnv = false;
 let extractedData = null;
 
 const fmt = (val) => new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR' }).format(val || 0);
 
+// Envoi avec basculement automatique Cloud Run -> Render
+async function sendSnapshotWithFallback(urls, payload) {
+  let lastError = null;
+  for (const url of urls) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      const data = await res.json();
+      return data;
+    } catch (e) {
+      console.warn(`[PEA Pro Extension] Échec avec ${url} (${e.message}), bascule sur secours...`);
+      lastError = e;
+    }
+  }
+  throw lastError || new Error("Tous les serveurs sont injoignables");
+}
+
 // Détection automatique du token depuis n'importe quel onglet PEA Pro ouvert (clé: pea_google_token)
 async function autoDetectToken() {
   try {
     const tabs = await chrome.tabs.query({});
     for (const t of tabs) {
-      if (t.url && (t.url.includes('192.168.') || t.url.includes('localhost') || t.url.includes('vercel.app') || t.url.includes('pea'))) {
+      if ((t.url && (t.url.includes('192.168.') || t.url.includes('localhost') || t.url.includes('vercel.app') || t.url.includes('pea'))) ||
+          (t.title && t.title.toLowerCase().includes('pea'))) {
         const results = await chrome.scripting.executeScript({
           target: { tabId: t.id },
           func: () => localStorage.getItem('pea_google_token') || sessionStorage.getItem('pea_google_token') || localStorage.getItem('token')
@@ -21,7 +56,7 @@ async function autoDetectToken() {
         
         if (results && results[0]?.result) {
           const tok = results[0].result;
-          console.log("🔑 [PEA Pro Extension] Jeton détecté automatiquement depuis l'onglet:", t.url);
+          console.log("🔑 [PEA Pro Extension] Jeton détecté automatiquement depuis l'onglet:", t.url || t.title);
           chrome.storage.local.set({ savedToken: tok });
           return tok;
         }
@@ -336,6 +371,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (response.totalVal > 0) {
         syncBtn.disabled = false;
         statusAlert.style.display = 'none';
+      } else {
+        syncBtn.disabled = true;
+        showAlert("ℹ️ Naviguez sur la page de votre contrat BNP pour détecter les montants.", "info");
       }
     }
   } catch (err) {
@@ -365,7 +403,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       return;
     }
 
-    const apiUrl = isTestEnv ? URL_TEST : URL_PROD;
+    const targetUrls = isTestEnv ? URLS_TEST : URLS_PROD;
     const targetMonth = monthInput.value || currentMonth;
 
     try {
@@ -380,13 +418,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         token: token
       };
 
-      const res = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      const data = await res.json();
+      const data = await sendSnapshotWithFallback(targetUrls, payload);
 
       if (data.success) {
         showAlert(`✅ Relevé de ${targetMonth} (${fmt(extractedData.totalVal)}) synchronisé avec succès !`, "success");
