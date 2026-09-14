@@ -1,4 +1,4 @@
-// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.5 ---
+// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.6 ---
 
 // URLs avec Cloud Run en primaire et Render en secours
 const URLS_PROD = [
@@ -47,7 +47,10 @@ async function autoDetectToken() {
   try {
     const tabs = await chrome.tabs.query({});
     for (const t of tabs) {
-      if ((t.url && (t.url.includes('192.168.') || t.url.includes('localhost') || t.url.includes('vercel.app') || t.url.includes('pea'))) ||
+      if (!t.url || t.url.startsWith('chrome://') || t.url.startsWith('chrome-extension://') || t.url.startsWith('edge://') || t.url.startsWith('about:')) {
+        continue;
+      }
+      if ((t.url.includes('192.168.') || t.url.includes('localhost') || t.url.includes('vercel.app') || t.url.includes('pea')) ||
           (t.title && t.title.toLowerCase().includes('pea'))) {
         const results = await chrome.scripting.executeScript({
           target: { tabId: t.id },
@@ -335,49 +338,81 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   };
 
-  // 3. Analyse propre du DOM
+  // 3. Analyse sécurisée du DOM
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab && tab.id) {
-      const results = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: runMultiContractBnpExtraction
-      }).catch(err => {
-        console.error("Injection error:", err);
-      });
+    
+    if (!tab || !tab.id) {
+      contractNameEl.innerText = "Aucun onglet";
+      showAlert("ℹ️ Aucun onglet actif détecté.", "info");
+      return;
+    }
 
-      const response = results && results[0]?.result;
+    const tabUrl = tab.url || '';
 
-      if (!response) {
-        contractNameEl.innerText = "Erreur de lecture";
-        showAlert("Impossible d'accéder aux données de cet onglet.", "error");
-        return;
-      }
+    // Sécurité : Ne jamais tenter d'injecter du code sur les pages système du navigateur (chrome://, edge://, about:)
+    const isSystemUrl = tabUrl.startsWith('chrome://') || 
+                        tabUrl.startsWith('chrome-extension://') || 
+                        tabUrl.startsWith('edge://') || 
+                        tabUrl.startsWith('about:') || 
+                        tabUrl.startsWith('view-source:') ||
+                        tabUrl.startsWith('devtools://');
 
-      extractedData = response;
-      contractNameEl.innerText = response.contractName || "BNP Multiplacements 2";
-      totalValueEl.innerText = fmt(response.totalVal);
-      fondEurosEl.innerText = fmt(response.fondEuros);
-      
-      const ucCount = response.details.filter(d => d.isin !== 'FONDS-EUROS').length;
-      ucTotalEl.innerText = ucCount > 0 
-        ? `${ucCount} UC (${fmt(response.ucTotal)})`
-        : `Gestion Pilotée (${fmt(response.ucTotal)})`;
-      
-      if (response.textPreview) {
-        debugBox.value = `[Lignes détectées]\n${response.textPreview}`;
-      }
+    if (isSystemUrl) {
+      contractNameEl.innerText = "Page système Chrome";
+      showAlert("ℹ️ Ouvrez l'onglet de votre contrat d'Assurance Vie sur BNP Paribas pour synchroniser.", "info");
+      syncBtn.disabled = true;
+      return;
+    }
 
-      if (response.totalVal > 0) {
-        syncBtn.disabled = false;
-        statusAlert.style.display = 'none';
-      } else {
-        syncBtn.disabled = true;
-        showAlert("ℹ️ Naviguez sur la page de votre contrat BNP pour détecter les montants.", "info");
-      }
+    // Si on n'est pas sur le site BNP Paribas
+    const isBnpPage = tabUrl.includes('bnpparibas');
+    if (!isBnpPage) {
+      contractNameEl.innerText = "Hors BNP Paribas";
+      showAlert("ℹ️ Rendez-vous sur votre espace mabanque.bnpparibas pour synchroniser.", "info");
+      syncBtn.disabled = true;
+      return;
+    }
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: runMultiContractBnpExtraction
+    }).catch(err => {
+      console.warn("[PEA Pro Extension] Avertissement injection :", err?.message || err);
+      return null;
+    });
+
+    const response = results && results[0]?.result;
+
+    if (!response) {
+      contractNameEl.innerText = "Lecture du contrat...";
+      showAlert("Impossible de lire les données : assurez-vous d'être sur la page du contrat BNP.", "error");
+      return;
+    }
+
+    extractedData = response;
+    contractNameEl.innerText = response.contractName || "BNP Multiplacements 2";
+    totalValueEl.innerText = fmt(response.totalVal);
+    fondEurosEl.innerText = fmt(response.fondEuros);
+    
+    const ucCount = response.details.filter(d => d.isin !== 'FONDS-EUROS').length;
+    ucTotalEl.innerText = ucCount > 0 
+      ? `${ucCount} UC (${fmt(response.ucTotal)})`
+      : `Gestion Pilotée (${fmt(response.ucTotal)})`;
+    
+    if (response.textPreview) {
+      debugBox.value = `[Lignes détectées]\n${response.textPreview}`;
+    }
+
+    if (response.totalVal > 0) {
+      syncBtn.disabled = false;
+      statusAlert.style.display = 'none';
+    } else {
+      syncBtn.disabled = true;
+      showAlert("ℹ️ Naviguez sur la page de votre contrat BNP pour détecter les montants.", "info");
     }
   } catch (err) {
-    console.error("Erreur globale:", err);
+    console.warn("[PEA Pro Extension] Avertissement analyse :", err?.message || err);
   }
 
   // 4. Synchronisation vers l'API PEA Pro
