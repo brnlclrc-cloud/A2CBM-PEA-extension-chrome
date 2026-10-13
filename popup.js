@@ -1,4 +1,4 @@
-// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.7 ---
+// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.8 ---
 
 // URLs avec Cloud Run en primaire et Render en secours
 const URLS_PROD = [

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "PEA Pro - Sync Assurance Vie BNP",
-  "version": "1.1.7",
+  "version": "1.1.8",
   "description": "Synchronisation automatique en 1 clic de votre Assurance Vie BNP Paribas vers PEA Pro.",
   "permissions": [
     "activeTab",
@@ -11,7 +11,15 @@
     "tabs"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "*://*.bnpparibas/*",
+    "*://*.bnpparibas.com/*",
+    "*://*.bnpparibas.net/*",
+    "*://*.bnp.fr/*",
+    "*://*.run.app/*",
+    "*://*.onrender.com/*",
+    "*://*.vercel.app/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "action": {
     "default_popup": "popup.html",
