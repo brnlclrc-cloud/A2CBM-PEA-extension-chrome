@@ -1,4 +1,4 @@
-// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.6 ---
+// --- popup.js : Logique d'interface et d'envoi vers PEA Pro v1.1.7 ---
 
 // URLs avec Cloud Run en primaire et Render en secours
 const URLS_PROD = [
@@ -18,21 +18,88 @@ let extractedData = null;
 
 const fmt = (val) => new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR' }).format(val || 0);
 
+// Décodage et inspection JWT (Google ID Token)
+function parseJwt(token) {
+  if (!token || typeof token !== 'string') return null;
+  try {
+    const parts = token.trim().split('.');
+    if (parts.length < 2) return null;
+    let base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) base64 += '=';
+    const jsonPayload = decodeURIComponent(
+      atob(base64)
+        .split('')
+        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    return JSON.parse(jsonPayload);
+  } catch (e) {
+    try {
+      let base64 = token.trim().split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (base64.length % 4) base64 += '=';
+      return JSON.parse(atob(base64));
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+
+function checkTokenValidity(token) {
+  if (!token || typeof token !== 'string' || token.trim().length === 0) {
+    return { valid: false, message: "Aucun jeton configuré" };
+  }
+  const payload = parseJwt(token);
+  if (!payload || !payload.exp) {
+    return { valid: false, message: "Format de jeton invalide (non JWT)" };
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const remainingSeconds = payload.exp - now;
+  const expDate = new Date(payload.exp * 1000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  const email = payload.email || 'Utilisateur';
+
+  if (remainingSeconds <= 0) {
+    return {
+      valid: false,
+      message: `Jeton expiré depuis ${expDate} (${email})`,
+      email,
+      exp: payload.exp
+    };
+  }
+
+  const mins = Math.floor(remainingSeconds / 60);
+  return {
+    valid: true,
+    message: `Valide encore ${mins} min (jusqu'à ${expDate} - ${email})`,
+    email,
+    exp: payload.exp
+  };
+}
+
 // Envoi avec basculement automatique Cloud Run -> Render
-async function sendSnapshotWithFallback(urls, payload) {
+async function sendSnapshotWithFallback(urls, payload, token) {
   let lastError = null;
   for (const url of urls) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+      const headers = { 
+        'Content-Type': 'application/json' 
+      };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
       const res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(payload),
         signal: controller.signal
       });
       clearTimeout(timeoutId);
-      const data = await res.json();
+
+      const data = await res.json().catch(() => null);
+      if (!data) {
+        throw new Error(`Réponse vide ou invalide (HTTP ${res.status})`);
+      }
       return data;
     } catch (e) {
       console.warn(`[PEA Pro Extension] Échec avec ${url} (${e.message}), bascule sur secours...`);
@@ -46,25 +113,56 @@ async function sendSnapshotWithFallback(urls, payload) {
 async function autoDetectToken() {
   try {
     const tabs = await chrome.tabs.query({});
+    const candidates = [];
+
     for (const t of tabs) {
       if (!t.url || t.url.startsWith('chrome://') || t.url.startsWith('chrome-extension://') || t.url.startsWith('edge://') || t.url.startsWith('about:')) {
         continue;
       }
-      if ((t.url.includes('192.168.') || t.url.includes('localhost') || t.url.includes('vercel.app') || t.url.includes('pea')) ||
-          (t.title && t.title.toLowerCase().includes('pea'))) {
+      const isPeaTab = (t.url.includes('192.168.') || t.url.includes('localhost') || t.url.includes('vercel.app') || t.url.includes('pea')) ||
+                       (t.title && t.title.toLowerCase().includes('pea'));
+      if (!isPeaTab) continue;
+
+      try {
         const results = await chrome.scripting.executeScript({
           target: { tabId: t.id },
           func: () => localStorage.getItem('pea_google_token') || sessionStorage.getItem('pea_google_token') || localStorage.getItem('token')
-        }).catch(() => []);
-        
-        if (results && results[0]?.result) {
-          const tok = results[0].result;
-          console.log("🔑 [PEA Pro Extension] Jeton détecté automatiquement depuis l'onglet:", t.url || t.title);
-          chrome.storage.local.set({ savedToken: tok });
-          return tok;
+        });
+
+        const tok = results && results[0]?.result;
+        if (tok) {
+          const validity = checkTokenValidity(tok);
+          candidates.push({
+            token: tok,
+            validity,
+            tabUrl: t.url,
+            tabTitle: t.title,
+            tabId: t.id
+          });
         }
+      } catch (errScript) {
+        // Ignorer silencieusement si l'onglet est suspendu ou inaccessible
       }
     }
+
+    // Priorité 1 : Le candidat valide avec la plus longue durée de vie restante
+    const validCandidates = candidates.filter(c => c.validity.valid);
+    if (validCandidates.length > 0) {
+      validCandidates.sort((a, b) => (b.validity.exp || 0) - (a.validity.exp || 0));
+      const best = validCandidates[0];
+      console.log("🔑 [PEA Pro Extension] Jeton VALIDE détecté depuis:", best.tabUrl, best.validity.message);
+      chrome.storage.local.set({ savedToken: best.token });
+      return { token: best.token, validity: best.validity, source: 'tab' };
+    }
+
+    // Si on a trouvé des onglets mais uniquement avec des jetons expirés
+    if (candidates.length > 0) {
+      candidates.sort((a, b) => (b.validity.exp || 0) - (a.validity.exp || 0));
+      const latestExpired = candidates[0];
+      console.warn("⚠️ [PEA Pro Extension] Jeton trouvé mais EXPIRÉ:", latestExpired.validity.message);
+      return { token: null, validity: latestExpired.validity, expiredCandidate: latestExpired.token, source: 'tab_expired' };
+    }
+
   } catch (e) {
     console.warn("Auto-detect token error:", e);
   }
@@ -267,9 +365,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const btnTest = document.getElementById('btnTest');
   const syncBtn = document.getElementById('syncBtn');
   const statusAlert = document.getElementById('statusAlert');
+  const openPeaProBtn = document.getElementById('openPeaProBtn');
   const toggleSettings = document.getElementById('toggleSettings');
   const tokenSection = document.getElementById('tokenSection');
   const tokenField = document.getElementById('tokenField');
+  const tokenStatusText = document.getElementById('tokenStatusText');
   const saveTokenBtn = document.getElementById('saveTokenBtn');
   const monthInput = document.getElementById('monthInput');
   const totalValueEl = document.getElementById('totalValue');
@@ -279,20 +379,46 @@ document.addEventListener('DOMContentLoaded', async () => {
   const toggleDebug = document.getElementById('toggleDebug');
   const debugBox = document.getElementById('debugBox');
 
+  // Mise à jour de l'indicateur visuel d'état du jeton
+  function updateTokenStatusUI(tok) {
+    if (!tokenStatusText) return;
+    const v = checkTokenValidity(tok);
+    if (!tok || !tok.trim()) {
+      tokenStatusText.innerText = "⚪ Aucun jeton configuré";
+      tokenStatusText.style.color = "#94a3b8";
+    } else if (v.valid) {
+      tokenStatusText.innerText = `🟢 ${v.message}`;
+      tokenStatusText.style.color = "#34d399";
+    } else {
+      tokenStatusText.innerText = `🔴 ${v.message}`;
+      tokenStatusText.style.color = "#f87171";
+    }
+    return v;
+  }
+
   // 1. Mois actuel
   const now = new Date();
   const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
   monthInput.value = currentMonth;
 
-  // 2. Toujours chercher en direct un token frais dans les onglets PEA Pro
-  let liveToken = await autoDetectToken();
-  if (liveToken) {
-    tokenField.value = liveToken;
+  // 2. Détection intelligente du jeton au démarrage
+  const detection = await autoDetectToken();
+  if (detection && detection.token) {
+    tokenField.value = detection.token;
+    updateTokenStatusUI(detection.token);
   } else {
     chrome.storage.local.get(['savedToken'], (res) => {
-      if (res.savedToken) tokenField.value = res.savedToken;
+      const tok = res.savedToken || detection?.expiredCandidate || '';
+      if (tok) {
+        tokenField.value = tok;
+        updateTokenStatusUI(tok);
+      }
     });
   }
+
+  tokenField.addEventListener('input', () => {
+    updateTokenStatusUI(tokenField.value.trim());
+  });
 
   chrome.storage.local.get(['isTestEnv'], (res) => {
     if (res.isTestEnv !== undefined) {
@@ -332,11 +458,36 @@ document.addEventListener('DOMContentLoaded', async () => {
   };
 
   saveTokenBtn.onclick = () => {
-    chrome.storage.local.set({ savedToken: tokenField.value.trim() }, () => {
-      showAlert("Jeton enregistré avec succès !", "success");
-      setTimeout(() => { statusAlert.style.display = 'none'; }, 2000);
+    const val = tokenField.value.trim();
+    const validity = updateTokenStatusUI(val);
+    chrome.storage.local.set({ savedToken: val }, () => {
+      if (validity.valid) {
+        showAlert(`✅ Jeton valide enregistré (${validity.message})`, "success");
+      } else {
+        showAlert(`⚠️ Jeton enregistré mais inactif : ${validity.message}`, "info");
+      }
+      setTimeout(() => { statusAlert.style.display = 'none'; }, 2500);
     });
   };
+
+  // Bouton d'ouverture ou rafraîchissement rapide de PEA Pro
+  if (openPeaProBtn) {
+    openPeaProBtn.onclick = async () => {
+      try {
+        const tabs = await chrome.tabs.query({});
+        const peaTab = tabs.find(t => t.url && (t.url.includes('a2-cbm-pea.vercel.app') || t.url.includes('localhost') || (t.title && t.title.toLowerCase().includes('pea'))));
+        if (peaTab && peaTab.id) {
+          await chrome.tabs.update(peaTab.id, { active: true });
+          if (peaTab.windowId) await chrome.windows.update(peaTab.windowId, { focused: true });
+          chrome.tabs.reload(peaTab.id);
+        } else {
+          chrome.tabs.create({ url: "https://a2-cbm-pea.vercel.app" });
+        }
+      } catch (e) {
+        chrome.tabs.create({ url: "https://a2-cbm-pea.vercel.app" });
+      }
+    };
+  }
 
   // 3. Analyse sécurisée du DOM
   try {
@@ -422,19 +573,54 @@ document.addEventListener('DOMContentLoaded', async () => {
     syncBtn.disabled = true;
     syncBtn.innerHTML = `<span>⏳</span> Synchronisation...`;
     statusAlert.style.display = 'none';
+    if (openPeaProBtn) openPeaProBtn.style.display = 'none';
 
-    // Récupération en direct du jeton le plus récent
-    let token = await autoDetectToken();
-    if (!token) {
-      const storageRes = await chrome.storage.local.get(['savedToken']);
-      token = storageRes.savedToken;
+    // Recherche d'un jeton valide (en direct d'abord, puis manuel, puis stocké)
+    let token = null;
+    let tokenValidity = null;
+
+    const liveDetect = await autoDetectToken();
+    if (liveDetect && liveDetect.token) {
+      token = liveDetect.token;
+      tokenValidity = liveDetect.validity;
+      tokenField.value = token;
+      updateTokenStatusUI(token);
+    }
+
+    if (!token && tokenField.value.trim()) {
+      const manualVal = checkTokenValidity(tokenField.value.trim());
+      if (manualVal.valid) {
+        token = tokenField.value.trim();
+        tokenValidity = manualVal;
+        chrome.storage.local.set({ savedToken: token });
+      } else {
+        tokenValidity = manualVal;
+      }
     }
 
     if (!token) {
-      showAlert("❌ Jeton manquant : ouvrez PEA Pro dans un onglet ou collez votre jeton dans ⚙️.", "error");
+      const storageRes = await chrome.storage.local.get(['savedToken']);
+      if (storageRes.savedToken) {
+        const storedVal = checkTokenValidity(storageRes.savedToken);
+        if (storedVal.valid) {
+          token = storageRes.savedToken;
+          tokenValidity = storedVal;
+          tokenField.value = token;
+          updateTokenStatusUI(token);
+        } else if (!tokenValidity) {
+          tokenValidity = storedVal;
+        }
+      }
+    }
+
+    // Si aucun jeton valide n'a pu être trouvé
+    if (!token) {
+      const reasonMsg = tokenValidity?.message || "Aucun jeton valide";
+      showAlert(`❌ Session expirée ou introuvable : ${reasonMsg}.\nCliquez ci-dessous pour ouvrir PEA Pro et vous reconnecter.`, "error");
       syncBtn.disabled = false;
       syncBtn.innerHTML = `<span>🚀</span> Réessayer la synchronisation`;
       tokenSection.style.display = 'block';
+      if (openPeaProBtn) openPeaProBtn.style.display = 'flex';
       return;
     }
 
@@ -453,18 +639,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         token: token
       };
 
-      const data = await sendSnapshotWithFallback(targetUrls, payload);
+      const data = await sendSnapshotWithFallback(targetUrls, payload, token);
 
-      if (data.success) {
+      if (data && data.success) {
         showAlert(`✅ Relevé de ${targetMonth} (${fmt(extractedData.totalVal)}) synchronisé avec succès !`, "success");
         syncBtn.innerHTML = `<span>✅</span> Synchronisé !`;
       } else {
-        // En cas de jeton expiré, on vide le cache et on guide l'utilisateur
-        if (data.error && (data.error.includes('Jeton') || data.error.includes('expiré') || data.error.includes('invalide'))) {
+        const errorMsg = data?.error || 'Erreur inattendue du serveur.';
+        if (errorMsg.includes('Jeton') || errorMsg.includes('expiré') || errorMsg.includes('invalide')) {
           chrome.storage.local.remove(['savedToken']);
-          showAlert(`❌ Session expirée : faites F5 dans votre onglet PEA Pro, puis recliquez ici.`, "error");
+          showAlert(`❌ Session refusée par le serveur : ${errorMsg}.\nRechargez PEA Pro pour régénérer votre session Google.`, "error");
+          if (openPeaProBtn) openPeaProBtn.style.display = 'flex';
         } else {
-          showAlert(`❌ Erreur API : ${data.error || 'Vérifiez votre session.'}`, "error");
+          showAlert(`❌ Erreur API : ${errorMsg}`, "error");
         }
         syncBtn.disabled = false;
         syncBtn.innerHTML = `<span>🚀</span> Réessayer la synchronisation`;
